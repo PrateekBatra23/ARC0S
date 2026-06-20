@@ -99,7 +99,7 @@ TRACELOOP_API_KEY = os.environ.get("TRACELOOP_API_KEY", "")
 # Override via OPENROUTER_MODEL if you want a different one from
 # openrouter.ai/models (e.g. a free model like "qwen/qwen3-coder:free").
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL= "openrouter/free"
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-3-flash-preview")
 OPENCODE_GO_API_KEY = os.environ.get("OPENCODE_GO_API_KEY", "")
 OPENCODE_GO_MODEL   = os.environ.get("OPENCODE_GO_MODEL", "kimi-k2.6")
 OPENCODE_GO_BASE    = "https://opencode.ai/zen/go/v1"
