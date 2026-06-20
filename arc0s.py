@@ -1,6 +1,6 @@
 """
-agent.py — Agent Arena Multi-Turn Google ADK Agent
-====================================================
+arc0s.py — ARC0S: Agent Arena Competitor on Google ADK
+========================================================
 
 A fully autonomous agent that navigates the Agent Arena:
   - Registers once and fetches each task DETERMINISTICALLY in Python
@@ -59,7 +59,7 @@ from traceloop.sdk.tracing import set_conversation_id
 
 # ── OTel logging ──────────────────────────────────────────────────────────────
 from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-from opentelemetry.sdk._logs.export import SimpleLogRecordProcessor, ConsoleLogExporter
+from opentelemetry.sdk._logs.export import SimpleLogRecordProcessor, ConsoleLogRecordExporter
 from opentelemetry.sdk.resources import Resource
 
 # ── Dynamic prompts ───────────────────────────────────────────────────────────
@@ -83,13 +83,23 @@ MCP_ENDPOINT = "https://agent-arena.dev/mcp"
 
 ID_TOKEN = os.environ.get("ID_TOKEN", "")
 
-AGENT_NAME    = "xpribot-v2"
-LINKEDIN_URL  = "https://www.linkedin.com/in/xprilion"
-GITHUB_URL    = "https://github.com/xprilion/agent-arena-bot"
+AGENT_NAME    = "ARC0S"
+LINKEDIN_URL  = "https://www.linkedin.com/in/prateekbatradel/"
+GITHUB_URL    = "https://github.com/PrateekBatra23/ARC0S"
 GEMINI_MODEL   = "gemini-3-flash-preview"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 TRACELOOP_API_KEY = os.environ.get("TRACELOOP_API_KEY", "")
 
+# OpenRouter — a separate quota pool from Google entirely, useful if the
+# Gemini free tier gets rate-limited mid-run. Defaults to Gemini 3 Flash
+# Preview via OpenRouter (google/gemini-3-flash-preview) — same model/tool-
+# calling behavior already proven in this harness, just billed through
+# OpenRouter instead of Google AI Studio. NOT a free model — $0.50/M input,
+# $3/M output tokens — fund your OpenRouter account with credits.
+# Override via OPENROUTER_MODEL if you want a different one from
+# openrouter.ai/models (e.g. a free model like "qwen/qwen3-coder:free").
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL= "openrouter/free"
 OPENCODE_GO_API_KEY = os.environ.get("OPENCODE_GO_API_KEY", "")
 OPENCODE_GO_MODEL   = os.environ.get("OPENCODE_GO_MODEL", "kimi-k2.6")
 OPENCODE_GO_BASE    = "https://opencode.ai/zen/go/v1"
@@ -103,6 +113,8 @@ USER_ID  = "arena-user"
 
 
 def _active_model():
+    if OPENROUTER_API_KEY and _LITELLM_AVAILABLE:
+        return LiteLlm(model=f"openrouter/{OPENROUTER_MODEL}", api_key=OPENROUTER_API_KEY)
     if OPENCODE_GO_API_KEY and _LITELLM_AVAILABLE:
         return LiteLlm(
             model=f"openai/{OPENCODE_GO_MODEL}",
@@ -113,6 +125,8 @@ def _active_model():
 
 
 def _active_model_name() -> str:
+    if OPENROUTER_API_KEY and _LITELLM_AVAILABLE:
+        return f"openrouter/{OPENROUTER_MODEL}"
     if OPENCODE_GO_API_KEY and _LITELLM_AVAILABLE:
         return f"opencode-go/{OPENCODE_GO_MODEL}"
     return GEMINI_MODEL
@@ -125,15 +139,17 @@ def _check_credentials() -> None:
     missing = []
     if not ID_TOKEN:
         missing.append("ID_TOKEN")
-    if not GEMINI_API_KEY and not (OPENCODE_GO_API_KEY and _LITELLM_AVAILABLE):
-        missing.append("GEMINI_API_KEY")
+    have_alt_model = (OPENROUTER_API_KEY or OPENCODE_GO_API_KEY) and _LITELLM_AVAILABLE
+    if not GEMINI_API_KEY and not have_alt_model:
+        missing.append("GEMINI_API_KEY (or OPENROUTER_API_KEY / OPENCODE_GO_API_KEY)")
     if missing:
         raise SystemExit(
             f"Missing required env var(s): {', '.join(missing)}.\n"
             "Set them in your environment or a .env file before running.\n"
-            "  ID_TOKEN       — sign in to the Arena web app, DevTools -> Application -> "
+            "  ID_TOKEN          — sign in to the Arena web app, DevTools -> Application -> "
             "Storage -> copy the Firebase id token (expires ~1hr, grab it right before running).\n"
-            "  GEMINI_API_KEY — https://aistudio.google.com"
+            "  GEMINI_API_KEY    — https://aistudio.google.com\n"
+            "  OPENROUTER_API_KEY — https://openrouter.ai/keys (alternative if Gemini quota is exhausted)"
         )
 
 
@@ -174,6 +190,14 @@ class RunState:
         self.tasks_passed    = 0
         self.level_history: list[dict] = []
 
+        # Bounded log of recent submissions (title + content), so a later task
+        # that references "the previous task" / "the X task" has something real
+        # to recall — sessions are fresh per task, so without this the model has
+        # zero memory of anything it already solved.
+        self.recent_submissions: list[dict] = []
+        self._RECENT_SUBMISSIONS_KEEP = 3
+        self._RECENT_SUBMISSION_CHAR_CAP = 600
+
         self.current_task: Optional[dict] = None
 
     def record(self, level: int, task_title: str, score: int, levelled_up: bool) -> None:
@@ -187,6 +211,14 @@ class RunState:
             "level": level, "task": task_title,
             "score": score, "levelled_up": levelled_up,
         })
+
+    def remember_submission(self, title: str, content: str) -> None:
+        """Keep the last N submissions' title + (capped) content so a future
+        task that references a previous one has real material to work from."""
+        cap = self._RECENT_SUBMISSION_CHAR_CAP
+        trimmed = content if len(content) <= cap else content[:cap] + " …[truncated]"
+        self.recent_submissions.append({"title": title, "content": trimmed})
+        self.recent_submissions = self.recent_submissions[-self._RECENT_SUBMISSIONS_KEEP:]
 
     def scoreboard(self) -> str:
         lines = [
@@ -240,7 +272,7 @@ def init_tracing() -> None:
         telemetry_enabled=False,
     )
     log_provider = LoggerProvider(resource=Resource.create({"service.name": APP_NAME}))
-    exporter = ConsoleLogExporter()
+    exporter = ConsoleLogRecordExporter()
     if TRACELOOP_API_KEY:
         from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
         exporter = OTLPLogExporter(
@@ -377,6 +409,35 @@ async def skip_task_call(state: RunState, reason: str) -> str:
     }, state)
 
 
+def _parse_submission_result(result: str) -> tuple[int, bool]:
+    """Parse score + level-up status from submit_task's response.
+
+    The live Arena returns JSON like {"status":"EVALUATED","score":55,...} —
+    not the "Score: NN/100" / "LEVEL_UP" text format assumed earlier, which
+    silently failed to match and always recorded -1 / never-leveled-up. JSON
+    is parsed first (the real format); regex is kept only as a fallback for
+    any non-JSON response shape. Level-up is determined by score >= 70, per
+    the documented threshold, rather than a server-supplied flag that may not
+    exist in this response shape.
+    """
+    try:
+        data = json.loads(result)
+        if isinstance(data, dict) and "score" in data:
+            score = int(data["score"])
+            levelled_up = bool(
+                data.get("levelUp") or data.get("leveledUp") or data.get("level_up")
+                or score >= 70
+            )
+            return score, levelled_up
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    score_match = re.search(r"Score:\s*(\d+)\s*/\s*100", result, re.IGNORECASE)
+    score = int(score_match.group(1)) if score_match else -1
+    levelled_up = "LEVEL_UP" in result.upper() or score >= 70
+    return score, levelled_up
+
+
 async def submit_task_call(state: RunState, content: str) -> str:
     new_exec = str(uuid.uuid4())
     state.execution_id = new_exec
@@ -400,12 +461,11 @@ async def submit_task_call(state: RunState, content: str) -> str:
         },
     }, state)
 
-    score_match = re.search(r"Score:\s*(\d+)/100", result, re.IGNORECASE)
-    score       = int(score_match.group(1)) if score_match else -1
-    levelled_up = "LEVEL_UP" in result.upper()
+    score, levelled_up = _parse_submission_result(result)
 
     task_title = state.current_task.get("title", state.task_id) if state.current_task else state.task_id
     state.record(state.current_level, task_title, score, levelled_up)
+    state.remember_submission(task_title, content)
 
     lu_emoji = "🚀 LEVEL_UP!" if levelled_up else ""
     _log("SCORE", f"{score}/100  {lu_emoji}")
@@ -485,6 +545,58 @@ def build_agent(state: RunState) -> LlmAgent:
 # Single-turn runner
 # ─────────────────────────────────────────────────────────────────────────────
 
+class FatalAgentError(Exception):
+    """Raised when the run cannot possibly continue (e.g. invalid API key,
+    revoked credentials). Propagated up to abort the whole run cleanly instead
+    of burning every remaining task hitting the identical failure."""
+
+
+class RateLimitError(Exception):
+    """Raised when the LLM call hits a quota/rate limit. Unlike a fatal error,
+    this is almost always transient — worth waiting and retrying the SAME
+    task, not abandoning it (a skip wastes a perfectly solvable task) and not
+    aborting the whole run (the limit usually clears within seconds/minutes)."""
+
+
+_FATAL_ERROR_MARKERS = (
+    "api_key_invalid", "api key not valid", "unauthenticated",
+    "permission_denied", "invalid_api_key",
+)
+
+_RATE_LIMIT_MARKERS = (
+    "resource_exhausted", "429", "rate limit", "ratelimit",
+    "quota", "too many requests",
+)
+
+_RATE_LIMIT_RETRIES = 6
+_RATE_LIMIT_BACKOFF  = 20  # seconds; doubles each retry: 15s, 30s, 60s
+
+
+def _exception_message(e: BaseException) -> str:
+    """Best-effort, NEVER-empty single-line description of an exception.
+
+    Some SDK exceptions (notably a bare asyncio.CancelledError, or errors
+    wrapped by tenacity's retry machinery) have an empty str(e) even though
+    the real detail is in repr(e), .args, or the chained __cause__/__context__.
+    Walking that chain is what actually surfaces the root cause instead of
+    silently logging an empty string.
+    """
+    seen, depth = e, 0
+    while seen is not None and depth < 4:
+        for candidate in (str(seen), repr(seen)):
+            candidate = candidate.strip()
+            if candidate and candidate not in ("None", ""):
+                first_line = candidate.splitlines()[0][:300]
+                if first_line.strip():
+                    return first_line
+        args_text = " ".join(str(a) for a in getattr(seen, "args", []) if str(a).strip())
+        if args_text.strip():
+            return args_text[:300]
+        seen = seen.__cause__ or seen.__context__
+        depth += 1
+    return type(e).__name__  # last resort — at least names the exception class
+
+
 async def run_turn(
     runner:          Runner,
     session_service: InMemorySessionService,
@@ -494,32 +606,79 @@ async def run_turn(
     content = genai_types.Content(role="user", parts=[genai_types.Part(text=message)])
 
     final_text = ""
-    async for event in runner.run_async(
-        user_id=USER_ID,
-        session_id=session_id,
-        new_message=content,
-    ):
-        if not event.content or not event.content.parts:
-            continue
+    try:
+        async for event in runner.run_async(
+            user_id=USER_ID,
+            session_id=session_id,
+            new_message=content,
+        ):
+            if not event.content or not event.content.parts:
+                continue
 
-        for part in event.content.parts:
-            if getattr(part, "function_call", None):
-                fc = part.function_call
-                args_str = str(dict(fc.args))
-                preview  = args_str[:120]
-                _log("AGENT", f"→ {fc.name}  {preview}{'...' if len(args_str) > 120 else ''}")
+            submitted_this_event = False
+            for part in event.content.parts:
+                if getattr(part, "function_call", None):
+                    fc = part.function_call
+                    args_str = str(dict(fc.args))
+                    preview  = args_str[:120]
+                    _log("AGENT", f"→ {fc.name}  {preview}{'...' if len(args_str) > 120 else ''}")
 
-            elif getattr(part, "function_response", None):
-                fr = part.function_response
-                resp_str = str(fr.response)[:150].replace("\n", " ")
-                _log("AGENT", f"← {fr.name}  {resp_str}{'...' if len(str(fr.response)) > 150 else ''}")
+                elif getattr(part, "function_response", None):
+                    fr = part.function_response
+                    resp_str = str(fr.response)[:150].replace("\n", " ")
+                    _log("AGENT", f"← {fr.name}  {resp_str}{'...' if len(str(fr.response)) > 150 else ''}")
+                    if fr.name == "submit_task":
+                        submitted_this_event = True
 
-        if event.is_final_response() and event.content.parts:
-            text = event.content.parts[0].text
-            if text:
-                final_text = text
+            if event.is_final_response() and event.content.parts:
+                text = event.content.parts[0].text
+                if text:
+                    final_text = text
+
+            if submitted_this_event:
+                # The task is done and can only be submitted once — anything
+                # the model does after this is pure wasted time/tokens (seen
+                # in practice: minutes of repeated, identical tool calls after
+                # a successful submission). Close the loop immediately rather
+                # than trusting the model to stop on its own.
+                _log("AGENT", "submit_task succeeded — ending this turn now (nothing further to do).")
+                break
+
+    except Exception as e:
+        msg = _exception_message(e)
+        haystack = f"{msg} {_exception_message(e.__cause__) if e.__cause__ else ''}".lower()
+        _log("ERROR", f"LLM call failed: {msg}")
+
+        if any(marker in haystack for marker in _RATE_LIMIT_MARKERS):
+            raise RateLimitError(msg) from e
+        if any(marker in haystack for marker in _FATAL_ERROR_MARKERS):
+            raise FatalAgentError(msg) from e
+        return ""  # non-fatal, non-rate-limit — caller's recovery/skip logic handles this
 
     return final_text
+
+
+async def run_turn_with_retry(
+    runner:          Runner,
+    session_service: InMemorySessionService,
+    session_id:      str,
+    message:         str,
+) -> str:
+    """Wraps run_turn with backoff-retry specifically for rate-limit errors.
+    FatalAgentError still propagates straight through, uncaught — that one
+    should abort the run, not retry."""
+    for attempt in range(1, _RATE_LIMIT_RETRIES + 1):
+        try:
+            return await run_turn(runner, session_service, session_id, message)
+        except RateLimitError as e:
+            if attempt < _RATE_LIMIT_RETRIES:
+                wait = _RATE_LIMIT_BACKOFF * (2 ** (attempt - 1))
+                _log("RETRY", f"Rate limited ({e}) — waiting {wait}s (attempt {attempt}/{_RATE_LIMIT_RETRIES})...")
+                await asyncio.sleep(wait)
+                continue
+            _log("ERROR", f"Still rate-limited after {_RATE_LIMIT_RETRIES} attempts — treating this task as failed for now.")
+            return ""
+    return ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -580,22 +739,31 @@ async def run() -> None:
         session_id = f"{state.run_id}-task-{task_num}"
         await session_service.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=session_id)
 
-        prompt = build_task_prompt(task, state.agent_id, state.task_id)
+        prompt = build_task_prompt(task, state.agent_id, state.task_id, state.recent_submissions)
         prev_attempted = state.tasks_attempted
 
         _log("AGENT", "Solving (analysis + grounding + solution + submit in one turn)...")
-        await run_turn(runner, session_service, session_id, prompt)
+        try:
+            await run_turn_with_retry(runner, session_service, session_id, prompt)
+        except FatalAgentError as e:
+            _log("ERROR", f"Fatal error — aborting run: {e}")
+            _log("ERROR", "Check your GEMINI_API_KEY in .env (or OPENCODE_GO_API_KEY if using that path), then rerun.")
+            break
 
         if state.tasks_attempted > prev_attempted:
             _log("SCORE", f"Task #{task_num} submitted successfully.")
         else:
             _log("WARN", f"Task #{task_num} was NOT submitted. Recovering...")
-            await run_turn(
-                runner, session_service, session_id,
-                "You have NOT submitted yet. Call submit_task(content=<your complete, "
-                "grounded final answer>) NOW, or skip_task(reason=...) if the task is "
-                "genuinely impossible to solve.",
-            )
+            try:
+                await run_turn_with_retry(
+                    runner, session_service, session_id,
+                    "You have NOT submitted yet. Call submit_task(content=<your complete, "
+                    "grounded final answer>) NOW, or skip_task(reason=...) if the task is "
+                    "genuinely impossible to solve.",
+                )
+            except FatalAgentError as e:
+                _log("ERROR", f"Fatal error during recovery — aborting run: {e}")
+                break
             if state.tasks_attempted == prev_attempted:
                 _log("ERROR", f"Recovery failed for task #{task_num}. Forcing a deterministic skip.")
                 await skip_task_call(state, reason="Agent failed to submit after recovery prompt.")

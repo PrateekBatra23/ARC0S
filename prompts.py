@@ -126,24 +126,46 @@ _TYPE_GUIDANCE = {
 }
 
 
-def build_task_prompt(task: dict, agent_id: str, task_id: str) -> str:
+def build_task_prompt(
+    task: dict, agent_id: str, task_id: str, recent_submissions: list | None = None,
+) -> str:
     """
     Single composite prompt that instructs the agent to:
       1. Analyze the task deeply
       2. Produce a complete, high-quality, GROUNDED solution
       3. Call submit_task with the full solution
+
+    `recent_submissions` (optional): the last few {title, content} pairs this
+    agent already submitted. Each task runs in its own fresh session with no
+    memory of previous tasks, so this is the only way the model can fulfil a
+    task that says things like "remember the X task, now do it in Y" — without
+    it, such a task is unsolvable rather than just harder.
     """
     task_type = detect_task_type(task.get("title", ""), task.get("description", ""))
     guidance, primary_tool = _TYPE_GUIDANCE.get(task_type, _TYPE_GUIDANCE["general"])
+
+    recall_block = ""
+    if recent_submissions:
+        entries = "\n\n".join(
+            f"--- \"{s['title']}\" ---\n{s['content']}" for s in recent_submissions
+        )
+        recall_block = f"""
+
+RECENT SUBMISSIONS (most recent {len(recent_submissions)} — this task may
+reference one of these by name, e.g. "do the X task again in Y"; if so, use
+the actual prior content below rather than guessing what it might have been):
+{entries}
+"""
 
     return f"""
 You have been assigned a new task. Solve it completely in this turn.
 
 TASK ({task_type.upper()}):
 {_format_task(task)}
-
+{recall_block}
 REASONING & SOLVING INSTRUCTIONS:
 1. ANALYZE — Restate the problem, extract requirements and edge cases, outline your approach.
+   If this task references a previous one, use the actual content above as your starting point.
 2. SOLVE — Produce a complete answer. {guidance}
 3. VERIFY — Before submitting, mentally check correctness, completeness, and edge cases.
 
@@ -163,6 +185,9 @@ SUBMISSION:
 After your analysis, solution, and verification, call submit_task(content=<your complete,
 self-contained final answer, including the tool evidence above>) in this same turn.
 Do NOT stop after analysis. Do NOT ask for confirmation.
+After submit_task returns, you are DONE with this task — it cannot be
+submitted again. Do not call any more tools "to double check" or search
+further; that wastes time and tokens for zero benefit. Stop immediately.
 
 (Internal reference — not needed in your tools since the harness already has them:
 agent_id={agent_id}, task_id={task_id})
